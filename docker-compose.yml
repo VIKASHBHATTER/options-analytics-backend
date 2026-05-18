@@ -1,0 +1,142 @@
+version: '3.8'
+
+services:
+  # PostgreSQL 15 - Partitioned Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: options_postgres
+    environment:
+      POSTGRES_USER: options_user
+      POSTGRES_PASSWORD: options_pass
+      POSTGRES_DB: options_analytics
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U options_user -d options_analytics"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - options_network
+
+  # Redis 7 - Cache + Pub/Sub + Queue
+  redis:
+    image: redis:7-alpine
+    container_name: options_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - options_network
+
+  # FastAPI Application
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: options_api
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://options_user:options_pass@postgres:5432/options_analytics
+      - REDIS_URL=redis://redis:6379
+      - DHAN_CLIENT_ID=${DHAN_CLIENT_ID}
+      - DHAN_ACCESS_TOKEN=${DHAN_ACCESS_TOKEN}
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
+      - ENVIRONMENT=development
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./src:/app/src
+      - ./config:/app/config
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - options_network
+    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # WebSocket Worker
+  websocket_worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    container_name: options_websocket_worker
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DHAN_CLIENT_ID=${DHAN_CLIENT_ID}
+      - DHAN_ACCESS_TOKEN=${DHAN_ACCESS_TOKEN}
+      - DATABASE_URL=postgresql+asyncpg://options_user:options_pass@postgres:5432/options_analytics
+    volumes:
+      - ./src:/app/src
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - options_network
+    command: python -m src.connectors.websocket_worker
+
+  # Greeks Engine Worker
+  greeks_worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    container_name: options_greeks_worker
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql+asyncpg://options_user:options_pass@postgres:5432/options_analytics
+    volumes:
+      - ./src:/app/src
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - options_network
+    command: python -m src.processors.greeks_worker
+
+  # Prometheus - Metrics
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: options_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    networks:
+      - options_network
+
+  # Grafana - Dashboards
+  grafana:
+    image: grafana/grafana:latest
+    container_name: options_grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./config/grafana/datasources:/etc/grafana/provisioning/datasources
+    networks:
+      - options_network
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  options_network:
+    driver: bridge
