@@ -1,0 +1,10 @@
+httpx
+tenacity
+redis
+pandas
+numpy
+requests
+python-dotenv
+pytz
+python-dateutil
+pydantic

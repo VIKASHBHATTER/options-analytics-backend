@@ -1,0 +1,15 @@
+Collecting dhanhq
+  Using cached dhanhq-2.2.0-py3-none-any.whl.metadata (13 kB)
+Collecting websockets
+  Using cached websockets-16.0-py3-none-any.whl.metadata (6.8 kB)
+Requirement already satisfied: python-dotenv in /data/data/com.termux/files/usr/lib/python3.13/site-packages (1.2.2)
+Requirement already satisfied: pandas in /data/data/com.termux/files/usr/lib/python3.13/site-packages (3.0.3)
+Requirement already satisfied: requests>=2.28.1 in /data/data/com.termux/files/usr/lib/python3.13/site-packages (from dhanhq) (2.33.1)
+Collecting pyOpenSSL>=20.0.1 (from dhanhq)
+  Using cached pyopenssl-26.2.0-py3-none-any.whl.metadata (19 kB)
+Requirement already satisfied: numpy>=1.26.0 in /data/data/com.termux/files/usr/lib/python3.13/site-packages (from pandas) (2.4.5)
+Requirement already satisfied: python-dateutil>=2.8.2 in /data/data/com.termux/files/usr/lib/python3.13/site-packages (from pandas) (2.9.0.post0)
+Collecting cryptography<49,>=46.0.0 (from pyOpenSSL>=20.0.1->dhanhq)
+  Using cached cryptography-48.0.0.tar.gz (832 kB)
+  Installing build dependencies: started
+  Installing build dependencies: finished with status 'error'
