@@ -3,6 +3,8 @@ import json
 import os
 import time
 import webbrowser
+import threading
+from queue import Queue
 from datetime import datetime
 from functools import wraps
 from typing import Dict, Any, Optional, List, Tuple
@@ -17,6 +19,7 @@ from config import get_config
 app = Flask(__name__)
 config = get_config()
 app.config.from_object(config)
+app.secret_key = config.SECRET_KEY
 CORS(app)
 
 # Setup logging
@@ -31,11 +34,34 @@ logger = logging.getLogger(__name__)
 # Initialize DhanClient
 dhan_client = None
 
+# WebSocket data storage
+ws_data = {
+    'market_feed': Queue(maxsize=1000),
+    'order_updates': Queue(maxsize=1000),
+    'full_depth': Queue(maxsize=1000)
+}
+
+# WebSocket threads
+ws_threads = {
+    'market_feed': None,
+    'order_updates': None,
+    'full_depth': None
+}
+
+# WebSocket flags
+ws_running = {
+    'market_feed': False,
+    'order_updates': False,
+    'full_depth': False
+}
+
 def get_dhan_client():
     """Get or initialize DhanClient"""
     global dhan_client
     if not dhan_client:
         dhan_client = DhanClient(client_id=config.DHAN_CLIENT_ID)
+        if config.DHAN_ACCESS_TOKEN:
+            dhan_client.set_access_token(config.DHAN_ACCESS_TOKEN)
     return dhan_client
 
 def error_handler(f):
@@ -53,7 +79,7 @@ def error_handler(f):
             }), 500
     return decorated_function
 
-# ==================== AUTH ENDPOINTS ====================
+# ==================== AUTHENTICATION ENDPOINTS ====================
 
 @app.route('/auth/health', methods=['GET'])
 @error_handler
@@ -74,7 +100,6 @@ def auth_status():
     logger.info("Status check called")
     client = get_dhan_client()
     try:
-        # Check if we have valid access token
         has_token = bool(config.DHAN_ACCESS_TOKEN)
         return jsonify({
             'success': True,
@@ -120,31 +145,34 @@ def dhan_context():
             'error': str(e)
         }), 400
 
-@app.route('/auth/oauth/login', methods=['GET'])
+@app.route('/auth/oauth/initiate', methods=['POST'])
 @error_handler
-def oauth_login():
+def oauth_initiate():
     """OAuth login endpoint"""
     logger.info("OAuth login initiated")
-    # Construct OAuth URL
     oauth_url = f"https://api.dhan.co/oauth/authorize?client_id={config.DHAN_OAUTH_CLIENT_ID}&redirect_uri={config.DHAN_OAUTH_REDIRECT_URI}&response_type=code"
-    logger.info(f"Redirecting to OAuth URL: {oauth_url}")
-    return redirect(oauth_url)
+    logger.info(f"OAuth URL: {oauth_url}")
+    return jsonify({
+        'success': True,
+        'oauth_url': oauth_url,
+        'message': 'Redirect to this URL to initiate OAuth'
+    })
 
-@app.route('/auth/callback', methods=['GET'])
+@app.route('/auth/oauth/token', methods=['POST'])
 @error_handler
-def oauth_callback():
-    """OAuth callback endpoint"""
-    code = request.args.get('code')
-    logger.info(f"OAuth callback received with code: {code}")
+def oauth_token():
+    """OAuth token exchange endpoint"""
+    logger.info("OAuth token exchange called")
+    data = request.get_json() or {}
+    code = data.get('code')
     
     if not code:
         return jsonify({
             'success': False,
-            'error': 'No authorization code received'
+            'error': 'Authorization code is required'
         }), 400
     
     try:
-        # Exchange code for access token
         import requests
         response = requests.post(
             'https://api.dhan.co/oauth/token',
@@ -163,7 +191,8 @@ def oauth_callback():
             return jsonify({
                 'success': True,
                 'message': 'OAuth authentication successful',
-                'access_token': token_data.get('access_token')
+                'access_token': token_data.get('access_token'),
+                'refresh_token': token_data.get('refresh_token')
             })
         else:
             logger.error(f"OAuth token exchange failed: {response.text}")
@@ -172,7 +201,7 @@ def oauth_callback():
                 'error': 'Token exchange failed'
             }), 400
     except Exception as e:
-        logger.error(f"OAuth callback error: {str(e)}")
+        logger.error(f"OAuth token error: {str(e)}")
         return jsonify({
             'success': False,
             'error': str(e)
@@ -193,7 +222,6 @@ def pin_totp_auth():
         }), 400
     
     try:
-        # Generate TOTP if secret is configured
         totp = None
         if config.DHAN_TOTP_SECRET:
             totp_generator = pyotp.TOTP(config.DHAN_TOTP_SECRET)
@@ -201,7 +229,6 @@ def pin_totp_auth():
             logger.info("TOTP generated successfully")
         
         client = get_dhan_client()
-        # Store credentials for later use
         session['pin'] = pin
         session['totp'] = totp
         
@@ -218,7 +245,7 @@ def pin_totp_auth():
             'error': str(e)
         }), 400
 
-@app.route('/auth/renew-token', methods=['POST'])
+@app.route('/auth/renew', methods=['POST'])
 @error_handler
 def renew_token():
     """Renew access token"""
@@ -266,7 +293,7 @@ def renew_token():
             'error': str(e)
         }), 500
 
-@app.route('/auth/user-profile', methods=['GET'])
+@app.route('/auth/profile', methods=['GET'])
 @error_handler
 def user_profile():
     """Get user profile"""
@@ -274,7 +301,6 @@ def user_profile():
     client = get_dhan_client()
     
     try:
-        # This would typically come from the API response
         profile = {
             'client_id': config.DHAN_CLIENT_ID,
             'authenticated': bool(config.DHAN_ACCESS_TOKEN),
@@ -294,7 +320,7 @@ def user_profile():
 
 # ==================== ORDERS ENDPOINTS ====================
 
-@app.route('/orders/place', methods=['POST'])
+@app.route('/order/place', methods=['POST'])
 @error_handler
 def place_order():
     """Place a new order"""
@@ -337,75 +363,7 @@ def place_order():
             'error': str(e)
         }), 400
 
-@app.route('/orders/modify', methods=['PUT'])
-@error_handler
-def modify_order():
-    """Modify an existing order"""
-    logger.info("Modify order called")
-    data = request.get_json() or {}
-    client = get_dhan_client()
-    
-    try:
-        required_fields = ['order_id']
-        for field in required_fields:
-            if field not in data:
-                return jsonify({
-                    'success': False,
-                    'error': f'{field} is required'
-                }), 400
-        
-        response = client.modify_order(
-            order_id=data['order_id'],
-            quantity=data.get('quantity'),
-            price=data.get('price'),
-            disclosed_quantity=data.get('disclosed_quantity'),
-            validity=data.get('validity', 'DAY')
-        )
-        
-        logger.info(f"Order modified successfully: {response}")
-        return jsonify({
-            'success': True,
-            'order_id': response.get('order_id'),
-            'data': response
-        })
-    except Exception as e:
-        logger.error(f"Modify order error: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 400
-
-@app.route('/orders/cancel', methods=['DELETE'])
-@error_handler
-def cancel_order():
-    """Cancel an order"""
-    logger.info("Cancel order called")
-    data = request.get_json() or {}
-    client = get_dhan_client()
-    
-    try:
-        if 'order_id' not in data:
-            return jsonify({
-                'success': False,
-                'error': 'order_id is required'
-            }), 400
-        
-        response = client.cancel_order(order_id=data['order_id'])
-        
-        logger.info(f"Order cancelled successfully: {response}")
-        return jsonify({
-            'success': True,
-            'order_id': response.get('order_id'),
-            'data': response
-        })
-    except Exception as e:
-        logger.error(f"Cancel order error: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 400
-
-@app.route('/orders/list', methods=['GET'])
+@app.route('/order/list', methods=['GET'])
 @error_handler
 def list_orders():
     """Get list of all orders"""
@@ -428,7 +386,7 @@ def list_orders():
             'orders': []
         }), 400
 
-@app.route('/orders/<order_id>', methods=['GET'])
+@app.route('/order/<order_id>', methods=['GET'])
 @error_handler
 def get_order_by_id(order_id):
     """Get order by order ID"""
@@ -449,7 +407,7 @@ def get_order_by_id(order_id):
             'error': str(e)
         }), 400
 
-@app.route('/orders/correlation/<correlation_id>', methods=['GET'])
+@app.route('/order/correlation/<correlation_id>', methods=['GET'])
 @error_handler
 def get_order_by_correlation_id(correlation_id):
     """Get order by correlation ID"""
@@ -457,7 +415,7 @@ def get_order_by_correlation_id(correlation_id):
     client = get_dhan_client()
     
     try:
-        response = client.get_order_by_correlation_id(order_correlation_id=correlation_id)
+        response = client.get_order_by_correlationID(order_correlation_id=correlation_id)
         logger.info(f"Order retrieved by correlation ID: {correlation_id}")
         return jsonify({
             'success': True,
@@ -470,17 +428,70 @@ def get_order_by_correlation_id(correlation_id):
             'error': str(e)
         }), 400
 
+@app.route('/order/modify/<order_id>', methods=['PUT'])
+@error_handler
+def modify_order(order_id):
+    """Modify an existing order"""
+    logger.info(f"Modify order called: {order_id}")
+    data = request.get_json() or {}
+    client = get_dhan_client()
+    
+    try:
+        response = client.modify_order(
+            order_id=order_id,
+            quantity=data.get('quantity'),
+            price=data.get('price'),
+            disclosed_quantity=data.get('disclosed_quantity'),
+            validity=data.get('validity', 'DAY')
+        )
+        
+        logger.info(f"Order modified successfully: {response}")
+        return jsonify({
+            'success': True,
+            'order_id': response.get('order_id'),
+            'data': response
+        })
+    except Exception as e:
+        logger.error(f"Modify order error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 400
+
+@app.route('/order/cancel/<order_id>', methods=['DELETE'])
+@error_handler
+def cancel_order(order_id):
+    """Cancel an order"""
+    logger.info(f"Cancel order called: {order_id}")
+    client = get_dhan_client()
+    
+    try:
+        response = client.cancel_order(order_id=order_id)
+        
+        logger.info(f"Order cancelled successfully: {response}")
+        return jsonify({
+            'success': True,
+            'order_id': response.get('order_id'),
+            'data': response
+        })
+    except Exception as e:
+        logger.error(f"Cancel order error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 400
+
 # ==================== PORTFOLIO ENDPOINTS ====================
 
 @app.route('/portfolio/funds', methods=['GET'])
 @error_handler
 def get_funds():
-    """Get fund details"""
+    """Get fund limits"""
     logger.info("Get funds called")
     client = get_dhan_client()
     
     try:
-        response = client.get_fund()
+        response = client.get_fund_limits()
         logger.info("Funds retrieved successfully")
         return jsonify({
             'success': True,
@@ -539,7 +550,7 @@ def get_holdings():
             'holdings': []
         }), 400
 
-@app.route('/portfolio/trade-book', methods=['GET'])
+@app.route('/portfolio/trades', methods=['GET'])
 @error_handler
 def get_trade_book():
     """Get trade book"""
@@ -587,137 +598,133 @@ def get_trade_history():
 
 # ==================== MARKET DATA ENDPOINTS ====================
 
-@app.route('/market/ohlc', methods=['POST'])
+@app.route('/data/quote/<symbol>', methods=['GET'])
 @error_handler
-def get_ohlc_data():
+def get_quote(symbol):
     """Get OHLC data"""
-    logger.info("Get OHLC data called")
-    data = request.get_json() or {}
+    logger.info(f"Get quote called: {symbol}")
     client = get_dhan_client()
     
     try:
-        required_fields = ['security_id', 'exchange_segment']
-        for field in required_fields:
-            if field not in data:
-                return jsonify({
-                    'success': False,
-                    'error': f'{field} is required'
-                }), 400
+        security_id = request.args.get('security_id')
+        exchange_segment = request.args.get('exchange_segment', 'NSE_EQ')
         
-        response = client.get_ohlc(
-            security_id=data['security_id'],
-            exchange_segment=data['exchange_segment']
-        )
+        if not security_id:
+            return jsonify({
+                'success': False,
+                'error': 'security_id is required'
+            }), 400
         
-        logger.info(f"OHLC data retrieved for security {data['security_id']}")
+        response = client.ohlc_data(security_id=security_id, exchange_segment=exchange_segment)
+        logger.info(f"OHLC data retrieved for security {security_id}")
         return jsonify({
             'success': True,
-            'ohlc': response
+            'quote': response
         })
     except Exception as e:
-        logger.error(f"Get OHLC error: {str(e)}")
+        logger.error(f"Get quote error: {str(e)}")
         return jsonify({
             'success': False,
             'error': str(e)
         }), 400
 
-@app.route('/market/historical-daily', methods=['POST'])
+@app.route('/data/historical/<symbol>', methods=['GET'])
 @error_handler
-def get_historical_daily():
+def get_historical_data(symbol):
     """Get historical daily data"""
-    logger.info("Get historical daily data called")
-    data = request.get_json() or {}
+    logger.info(f"Get historical data called: {symbol}")
     client = get_dhan_client()
     
     try:
-        required_fields = ['security_id', 'exchange_segment']
-        for field in required_fields:
-            if field not in data:
-                return jsonify({
-                    'success': False,
-                    'error': f'{field} is required'
-                }), 400
+        security_id = request.args.get('security_id')
+        exchange_segment = request.args.get('exchange_segment', 'NSE_EQ')
         
-        response = client.get_historical_daily_data(
-            security_id=data['security_id'],
-            exchange_segment=data['exchange_segment'],
-            start_date=data.get('start_date'),
-            end_date=data.get('end_date')
+        if not security_id:
+            return jsonify({
+                'success': False,
+                'error': 'security_id is required'
+            }), 400
+        
+        response = client.historical_daily_data(
+            security_id=security_id,
+            exchange_segment=exchange_segment
         )
         
-        logger.info(f"Historical daily data retrieved for security {data['security_id']}")
+        logger.info(f"Historical data retrieved for security {security_id}")
         return jsonify({
             'success': True,
             'data': response if isinstance(response, list) else [response],
             'count': len(response) if isinstance(response, list) else 1
         })
     except Exception as e:
-        logger.error(f"Get historical daily error: {str(e)}")
+        logger.error(f"Get historical data error: {str(e)}")
         return jsonify({
             'success': False,
             'error': str(e)
         }), 400
 
-@app.route('/market/intraday-minute', methods=['POST'])
+@app.route('/data/intraday/<symbol>', methods=['GET'])
 @error_handler
-def get_intraday_minute():
+def get_intraday_data(symbol):
     """Get intraday minute data"""
-    logger.info("Get intraday minute data called")
-    data = request.get_json() or {}
+    logger.info(f"Get intraday data called: {symbol}")
     client = get_dhan_client()
     
     try:
-        required_fields = ['security_id', 'exchange_segment']
-        for field in required_fields:
-            if field not in data:
-                return jsonify({
-                    'success': False,
-                    'error': f'{field} is required'
-                }), 400
+        security_id = request.args.get('security_id')
+        exchange_segment = request.args.get('exchange_segment', 'NSE_EQ')
         
-        response = client.get_intraday_minute_data(
-            security_id=data['security_id'],
-            exchange_segment=data['exchange_segment']
+        if not security_id:
+            return jsonify({
+                'success': False,
+                'error': 'security_id is required'
+            }), 400
+        
+        response = client.intraday_minute_data(
+            security_id=security_id,
+            exchange_segment=exchange_segment
         )
         
-        logger.info(f"Intraday minute data retrieved for security {data['security_id']}")
+        logger.info(f"Intraday data retrieved for security {security_id}")
         return jsonify({
             'success': True,
             'data': response if isinstance(response, list) else [response],
             'count': len(response) if isinstance(response, list) else 1
         })
     except Exception as e:
-        logger.error(f"Get intraday minute error: {str(e)}")
+        logger.error(f"Get intraday data error: {str(e)}")
         return jsonify({
             'success': False,
             'error': str(e)
         }), 400
 
-@app.route('/market/option-chain', methods=['POST'])
+@app.route('/data/option-chain/<symbol>', methods=['GET'])
 @error_handler
-def get_option_chain():
-    """Get option chain data"""
-    logger.info("Get option chain called")
-    data = request.get_json() or {}
+def get_option_chain(symbol):
+    """Get option chain data with Greeks"""
+    logger.info(f"Get option chain called: {symbol}")
     client = get_dhan_client()
     
     try:
-        required_fields = ['security_id']
-        for field in required_fields:
-            if field not in data:
-                return jsonify({
-                    'success': False,
-                    'error': f'{field} is required'
-                }), 400
+        security_id = request.args.get('security_id')
+        expiry_date = request.args.get('expiry_date')
+        strike_price = request.args.get('strike_price')
+        option_type = request.args.get('option_type')
         
-        response = client.get_option_chain(
-            security_id=data['security_id'],
-            expiry_date=data.get('expiry_date'),
-            strike_price=data.get('strike_price'),
-            option_type=data.get('option_type')
+        if not security_id:
+            return jsonify({
+                'success': False,
+                'error': 'security_id is required'
+            }), 400
+        
+        response = client.option_chain(
+            security_id=security_id,
+            expiry_date=expiry_date,
+            strike_price=strike_price,
+            option_type=option_type
         )
         
-        logger.info(f"Option chain retrieved for security {data['security_id']}")
+        logger.info(f"Option chain retrieved for security {security_id}")
         return jsonify({
             'success': True,
             'option_chain': response if isinstance(response, list) else [response],
@@ -730,15 +737,15 @@ def get_option_chain():
             'error': str(e)
         }), 400
 
-@app.route('/market/expired-options', methods=['GET'])
+@app.route('/data/expired-options', methods=['GET'])
 @error_handler
 def get_expired_options():
-    """Get expired options"""
+    """Get expired options data"""
     logger.info("Get expired options called")
     client = get_dhan_client()
     
     try:
-        response = client.get_expired_options()
+        response = client.expired_options_data()
         logger.info(f"Expired options retrieved: {len(response) if isinstance(response, list) else 1}")
         return jsonify({
             'success': True,
@@ -753,15 +760,23 @@ def get_expired_options():
             'expired_options': []
         }), 400
 
-@app.route('/market/expiry-list', methods=['GET'])
+@app.route('/data/expiry-list/<symbol>', methods=['GET'])
 @error_handler
-def get_expiry_list():
+def get_expiry_list(symbol):
     """Get expiry list"""
-    logger.info("Get expiry list called")
+    logger.info(f"Get expiry list called: {symbol}")
     client = get_dhan_client()
     
     try:
-        response = client.get_expiry_list()
+        security_id = request.args.get('security_id')
+        
+        if not security_id:
+            return jsonify({
+                'success': False,
+                'error': 'security_id is required'
+            }), 400
+        
+        response = client.expiry_list(security_id=security_id)
         logger.info(f"Expiry list retrieved: {len(response) if isinstance(response, list) else 1}")
         return jsonify({
             'success': True,
@@ -776,7 +791,7 @@ def get_expiry_list():
             'expiry_list': []
         }), 400
 
-@app.route('/market/security-list', methods=['GET'])
+@app.route('/data/security-list', methods=['GET'])
 @error_handler
 def get_security_list():
     """Get security list"""
@@ -784,7 +799,7 @@ def get_security_list():
     client = get_dhan_client()
     
     try:
-        response = client.get_security_list()
+        response = client.fetch_security_list()
         logger.info(f"Security list retrieved: {len(response) if isinstance(response, list) else 1}")
         return jsonify({
             'success': True,
@@ -799,12 +814,12 @@ def get_security_list():
             'securities': []
         }), 400
 
-# ==================== FOREVER ORDERS ENDPOINTS ====================
+# ==================== FOREVER ORDERS (GTT) ENDPOINTS ====================
 
-@app.route('/forever-orders/place', methods=['POST'])
+@app.route('/forever/place', methods=['POST'])
 @error_handler
 def place_forever_order():
-    """Place a forever order"""
+    """Place a forever order (GTT)"""
     logger.info("Place forever order called")
     data = request.get_json() or {}
     client = get_dhan_client()
@@ -818,7 +833,7 @@ def place_forever_order():
                     'error': f'{field} is required'
                 }), 400
         
-        response = client.place_forever_order(
+        response = client.place_forever(
             security_id=data['security_id'],
             exchange_segment=data['exchange_segment'],
             transaction_type=data['transaction_type'],
@@ -840,23 +855,17 @@ def place_forever_order():
             'error': str(e)
         }), 400
 
-@app.route('/forever-orders/modify', methods=['PUT'])
+@app.route('/forever/modify/<order_id>', methods=['PUT'])
 @error_handler
-def modify_forever_order():
+def modify_forever_order(order_id):
     """Modify a forever order"""
-    logger.info("Modify forever order called")
+    logger.info(f"Modify forever order called: {order_id}")
     data = request.get_json() or {}
     client = get_dhan_client()
     
     try:
-        if 'order_id' not in data:
-            return jsonify({
-                'success': False,
-                'error': 'order_id is required'
-            }), 400
-        
-        response = client.modify_forever_order(
-            order_id=data['order_id'],
+        response = client.modify_forever(
+            order_id=order_id,
             quantity=data.get('quantity'),
             price=data.get('price')
         )
@@ -874,22 +883,15 @@ def modify_forever_order():
             'error': str(e)
         }), 400
 
-@app.route('/forever-orders/cancel', methods=['DELETE'])
+@app.route('/forever/cancel/<order_id>', methods=['DELETE'])
 @error_handler
-def cancel_forever_order():
+def cancel_forever_order(order_id):
     """Cancel a forever order"""
-    logger.info("Cancel forever order called")
-    data = request.get_json() or {}
+    logger.info(f"Cancel forever order called: {order_id}")
     client = get_dhan_client()
     
     try:
-        if 'order_id' not in data:
-            return jsonify({
-                'success': False,
-                'error': 'order_id is required'
-            }), 400
-        
-        response = client.cancel_forever_order(order_id=data['order_id'])
+        response = client.cancel_forever(order_id=order_id)
         
         logger.info(f"Forever order cancelled successfully: {response}")
         return jsonify({
@@ -904,68 +906,231 @@ def cancel_forever_order():
             'error': str(e)
         }), 400
 
-# ==================== WEBSOCKET ENDPOINTS ====================
+# ==================== WEBSOCKET LIVE FEED ENDPOINTS ====================
 
-@app.route('/websocket/market-feed', methods=['GET'])
-@error_handler
-def websocket_market_feed():
-    """Market feed WebSocket configuration"""
-    logger.info("Market feed WebSocket endpoint called")
+def market_feed_worker():
+    """Background worker for market feed"""
+    logger.info("Market feed worker started")
     try:
+        from dhanhq import MarketFeed
+        client = get_dhan_client()
+        market_feed = MarketFeed(client)
+        
+        while ws_running['market_feed']:
+            try:
+                data = market_feed.get_data()
+                if data:
+                    ws_data['market_feed'].put(data)
+                time.sleep(0.1)
+            except Exception as e:
+                logger.error(f"Market feed worker error: {str(e)}")
+                time.sleep(1)
+    except Exception as e:
+        logger.error(f"Market feed initialization error: {str(e)}")
+
+def order_update_worker():
+    """Background worker for order updates"""
+    logger.info("Order update worker started")
+    try:
+        from dhanhq import OrderUpdate
+        client = get_dhan_client()
+        order_update = OrderUpdate(client)
+        
+        while ws_running['order_updates']:
+            try:
+                data = order_update.get_data()
+                if data:
+                    ws_data['order_updates'].put(data)
+                time.sleep(0.1)
+            except Exception as e:
+                logger.error(f"Order update worker error: {str(e)}")
+                time.sleep(1)
+    except Exception as e:
+        logger.error(f"Order update initialization error: {str(e)}")
+
+def full_depth_worker(level=20):
+    """Background worker for full depth"""
+    logger.info(f"Full depth worker started (level: {level})")
+    try:
+        from dhanhq import FullDepth
+        client = get_dhan_client()
+        full_depth = FullDepth(client, level=level)
+        
+        while ws_running['full_depth']:
+            try:
+                data = full_depth.get_data()
+                if data:
+                    ws_data['full_depth'].put(data)
+                time.sleep(0.1)
+            except Exception as e:
+                logger.error(f"Full depth worker error: {str(e)}")
+                time.sleep(1)
+    except Exception as e:
+        logger.error(f"Full depth initialization error: {str(e)}")
+
+@app.route('/ws/market-feed/start', methods=['POST'])
+@error_handler
+def start_market_feed():
+    """Start market feed WebSocket"""
+    logger.info("Start market feed called")
+    try:
+        if not ws_running['market_feed']:
+            ws_running['market_feed'] = True
+            ws_threads['market_feed'] = threading.Thread(target=market_feed_worker, daemon=True)
+            ws_threads['market_feed'].start()
+            logger.info("Market feed started")
+        
         return jsonify({
             'success': True,
-            'message': 'Market feed WebSocket available',
-            'connection_url': 'ws://localhost:5000/ws/market-feed',
-            'channels': ['price', 'volume', 'trades']
+            'message': 'Market feed started'
         })
     except Exception as e:
-        logger.error(f"Market feed WebSocket error: {str(e)}")
+        logger.error(f"Start market feed error: {str(e)}")
         return jsonify({
             'success': False,
             'error': str(e)
         }), 400
 
-@app.route('/websocket/order-update', methods=['GET'])
+@app.route('/ws/market-feed/data', methods=['GET'])
 @error_handler
-def websocket_order_update():
-    """Order update WebSocket configuration"""
-    logger.info("Order update WebSocket endpoint called")
+def get_market_feed_data():
+    """Get market feed data"""
+    logger.info("Get market feed data called")
     try:
+        data_list = []
+        while not ws_data['market_feed'].empty():
+            data_list.append(ws_data['market_feed'].get())
+        
         return jsonify({
             'success': True,
-            'message': 'Order update WebSocket available',
-            'connection_url': 'ws://localhost:5000/ws/order-update',
-            'events': ['order_placed', 'order_executed', 'order_rejected', 'order_modified', 'order_cancelled']
+            'data': data_list,
+            'count': len(data_list)
         })
     except Exception as e:
-        logger.error(f"Order update WebSocket error: {str(e)}")
+        logger.error(f"Get market feed data error: {str(e)}")
         return jsonify({
             'success': False,
             'error': str(e)
         }), 400
 
-@app.route('/websocket/full-depth', methods=['GET'])
+@app.route('/ws/market-feed/stop', methods=['POST'])
 @error_handler
-def websocket_full_depth():
-    """Full depth WebSocket configuration"""
-    logger.info("Full depth WebSocket endpoint called")
+def stop_market_feed():
+    """Stop market feed WebSocket"""
+    logger.info("Stop market feed called")
     try:
+        ws_running['market_feed'] = False
+        if ws_threads['market_feed']:
+            ws_threads['market_feed'].join(timeout=5)
+        logger.info("Market feed stopped")
+        
         return jsonify({
             'success': True,
-            'message': 'Full depth WebSocket available',
-            'connection_url': 'ws://localhost:5000/ws/full-depth',
-            'data': ['bid_queue', 'ask_queue']
+            'message': 'Market feed stopped'
         })
     except Exception as e:
-        logger.error(f"Full depth WebSocket error: {str(e)}")
+        logger.error(f"Stop market feed error: {str(e)}")
         return jsonify({
             'success': False,
             'error': str(e)
         }), 400
 
-# ==================== eDIS ENDPOINTS ====================
+@app.route('/ws/order-updates/start', methods=['POST'])
+@error_handler
+def start_order_updates():
+    """Start order updates WebSocket"""
+    logger.info("Start order updates called")
+    try:
+        if not ws_running['order_updates']:
+            ws_running['order_updates'] = True
+            ws_threads['order_updates'] = threading.Thread(target=order_update_worker, daemon=True)
+            ws_threads['order_updates'].start()
+            logger.info("Order updates started")
+        
+        return jsonify({
+            'success': True,
+            'message': 'Order updates started'
+        })
+    except Exception as e:
+        logger.error(f"Start order updates error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 400
 
-@app.route('/edis/generate-tpin', methods=['POST'])
+@app.route('/ws/order-updates/data', methods=['GET'])
+@error_handler
+def get_order_updates_data():
+    """Get order updates data"""
+    logger.info("Get order updates data called")
+    try:
+        data_list = []
+        while not ws_data['order_updates'].empty():
+            data_list.append(ws_data['order_updates'].get())
+        
+        return jsonify({
+            'success': True,
+            'data': data_list,
+            'count': len(data_list)
+        })
+    except Exception as e:
+        logger.error(f"Get order updates data error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 400
+
+@app.route('/ws/full-depth/start', methods=['POST'])
+@error_handler
+def start_full_depth():
+    """Start full depth WebSocket"""
+    logger.info("Start full depth called")
+    data = request.get_json() or {}
+    level = data.get('level', 20)
+    
+    try:
+        if not ws_running['full_depth']:
+            ws_running['full_depth'] = True
+            ws_threads['full_depth'] = threading.Thread(target=full_depth_worker, args=(level,), daemon=True)
+            ws_threads['full_depth'].start()
+            logger.info(f"Full depth started (level: {level})")
+        
+        return jsonify({
+            'success': True,
+            'message': f'Full depth started (level: {level})'
+        })
+    except Exception as e:
+        logger.error(f"Start full depth error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 400
+
+@app.route('/ws/full-depth/data', methods=['GET'])
+@error_handler
+def get_full_depth_data():
+    """Get full depth data"""
+    logger.info("Get full depth data called")
+    try:
+        data_list = []
+        while not ws_data['full_depth'].empty():
+            data_list.append(ws_data['full_depth'].get())
+        
+        return jsonify({
+            'success': True,
+            'data': data_list,
+            'count': len(data_list)
+        })
+    except Exception as e:
+        logger.error(f"Get full depth data error: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 400
+
+# ==================== eDIS / CDSL ENDPOINTS ====================
+
+@app.route('/edis/tpin', methods=['POST'])
 @error_handler
 def generate_tpin():
     """Generate eDIS TPIN"""
@@ -979,7 +1144,7 @@ def generate_tpin():
             quantity=data.get('quantity')
         )
         
-        logger.info(f"TPIN generated successfully")
+        logger.info("TPIN generated successfully")
         return jsonify({
             'success': True,
             'tpin': response.get('tpin'),
@@ -992,12 +1157,13 @@ def generate_tpin():
             'error': str(e)
         }), 400
 
-@app.route('/edis/open-browser-tpin', methods=['POST'])
+@app.route('/edis/browser', methods=['POST'])
 @error_handler
 def open_browser_for_tpin():
     """Open browser for eDIS TPIN"""
     logger.info("Open browser for TPIN called")
     data = request.get_json() or {}
+    client = get_dhan_client()
     
     try:
         tpin_url = data.get('tpin_url')
@@ -1007,8 +1173,9 @@ def open_browser_for_tpin():
                 'error': 'tpin_url is required'
             }), 400
         
-        webbrowser.open(tpin_url)
-        logger.info(f"Browser opened for TPIN")
+        client.open_browser_for_tpin(tpin_url=tpin_url)
+        logger.info("Browser opened for TPIN")
+        
         return jsonify({
             'success': True,
             'message': 'Browser opened for TPIN verification'
@@ -1020,20 +1187,24 @@ def open_browser_for_tpin():
             'error': str(e)
         }), 400
 
-@app.route('/edis/inquiry', methods=['POST'])
+@app.route('/edis/inquiry', methods=['GET'])
 @error_handler
 def edis_inquiry():
     """eDIS inquiry"""
     logger.info("eDIS inquiry called")
-    data = request.get_json() or {}
     client = get_dhan_client()
     
     try:
-        response = client.get_edis_inquiry(
-            isin=data.get('isin')
-        )
+        isin = request.args.get('isin')
+        if not isin:
+            return jsonify({
+                'success': False,
+                'error': 'isin is required'
+            }), 400
         
-        logger.info(f"eDIS inquiry retrieved")
+        response = client.edis_inquiry(isin=isin)
+        
+        logger.info("eDIS inquiry retrieved")
         return jsonify({
             'success': True,
             'inquiry': response
@@ -1045,9 +1216,9 @@ def edis_inquiry():
             'error': str(e)
         }), 400
 
-# ==================== IP ENDPOINTS ====================
+# ==================== IP MANAGEMENT ENDPOINTS ====================
 
-@app.route('/ip/set', methods=['POST'])
+@app.route('/admin/set-ip', methods=['POST'])
 @error_handler
 def set_ip():
     """Set user IP"""
@@ -1062,7 +1233,9 @@ def set_ip():
                 'error': 'ip_address is required'
             }), 400
         
-        response = client.set_ip(ip_address=data['ip_address'])
+        from dhanhq import DhanLogin
+        login = DhanLogin()
+        response = login.set_ip(ip_address=data['ip_address'])
         
         logger.info(f"IP set successfully: {data['ip_address']}")
         return jsonify({
@@ -1077,7 +1250,7 @@ def set_ip():
             'error': str(e)
         }), 400
 
-@app.route('/ip/modify', methods=['PUT'])
+@app.route('/admin/modify-ip', methods=['PUT'])
 @error_handler
 def modify_ip():
     """Modify user IP"""
@@ -1092,7 +1265,9 @@ def modify_ip():
                 'error': 'old_ip and new_ip are required'
             }), 400
         
-        response = client.modify_ip(
+        from dhanhq import DhanLogin
+        login = DhanLogin()
+        response = login.modify_ip(
             old_ip=data['old_ip'],
             new_ip=data['new_ip']
         )
@@ -1111,7 +1286,7 @@ def modify_ip():
             'error': str(e)
         }), 400
 
-@app.route('/ip/get', methods=['GET'])
+@app.route('/admin/get-ip', methods=['GET'])
 @error_handler
 def get_ip():
     """Get user IP"""
@@ -1119,8 +1294,11 @@ def get_ip():
     client = get_dhan_client()
     
     try:
-        response = client.get_ip()
-        logger.info(f"IP retrieved successfully")
+        from dhanhq import DhanLogin
+        login = DhanLogin()
+        response = login.get_ip()
+        
+        logger.info("IP retrieved successfully")
         return jsonify({
             'success': True,
             'ip_address': response.get('ip_address') if isinstance(response, dict) else response,
@@ -1135,11 +1313,11 @@ def get_ip():
 
 # ==================== UTILITY ENDPOINTS ====================
 
-@app.route('/util/health', methods=['GET'])
+@app.route('/health', methods=['GET'])
 @error_handler
-def util_health():
-    """Health check utility"""
-    logger.info("Health check utility called")
+def health():
+    """Health check"""
+    logger.info("Health check called")
     return jsonify({
         'success': True,
         'status': 'healthy',
@@ -1148,11 +1326,11 @@ def util_health():
         'version': '1.0.0'
     })
 
-@app.route('/util/status', methods=['GET'])
+@app.route('/status', methods=['GET'])
 @error_handler
-def util_status():
-    """Status utility"""
-    logger.info("Status utility called")
+def status():
+    """Status endpoint"""
+    logger.info("Status endpoint called")
     try:
         client = get_dhan_client()
         return jsonify({
@@ -1163,19 +1341,20 @@ def util_status():
             'timestamp': datetime.utcnow().isoformat()
         })
     except Exception as e:
-        logger.error(f"Status utility error: {str(e)}")
+        logger.error(f"Status endpoint error: {str(e)}")
         return jsonify({
             'success': False,
             'status': 'error',
             'error': str(e)
         }), 500
 
-@app.route('/util/time-converter', methods=['POST'])
+@app.route('/utility/time-convert', methods=['POST'])
 @error_handler
 def time_converter():
     """Time converter utility"""
     logger.info("Time converter utility called")
     data = request.get_json() or {}
+    client = get_dhan_client()
     
     try:
         timestamp = data.get('timestamp')
@@ -1191,14 +1370,27 @@ def time_converter():
         else:
             dt = datetime.fromisoformat(timestamp)
         
-        logger.info(f"Time converted: {timestamp}")
-        return jsonify({
-            'success': True,
-            'input': timestamp,
-            'iso_format': dt.isoformat(),
-            'unix_timestamp': dt.timestamp(),
-            'readable': dt.strftime('%Y-%m-%d %H:%M:%S')
-        })
+        # Use client's time converter if available
+        try:
+            response = client.convert_to_date_time(timestamp=timestamp)
+            logger.info(f"Time converted: {timestamp}")
+            return jsonify({
+                'success': True,
+                'input': timestamp,
+                'iso_format': dt.isoformat(),
+                'unix_timestamp': dt.timestamp(),
+                'readable': dt.strftime('%Y-%m-%d %H:%M:%S'),
+                'sdk_response': response
+            })
+        except:
+            logger.info(f"Time converted (no SDK): {timestamp}")
+            return jsonify({
+                'success': True,
+                'input': timestamp,
+                'iso_format': dt.isoformat(),
+                'unix_timestamp': dt.timestamp(),
+                'readable': dt.strftime('%Y-%m-%d %H:%M:%S')
+            })
     except Exception as e:
         logger.error(f"Time converter error: {str(e)}")
         return jsonify({
@@ -1206,7 +1398,7 @@ def time_converter():
             'error': str(e)
         }), 400
 
-@app.route('/util/indices', methods=['GET'])
+@app.route('/utility/indices', methods=['GET'])
 @error_handler
 def get_indices():
     """Get market indices"""
@@ -1269,66 +1461,71 @@ def api_documentation():
         'name': 'DhanHQ Analytics Backend',
         'version': '1.0.0',
         'client_id': config.DHAN_CLIENT_ID,
+        'sdk_version': 'dhanhq==2.2.0',
         'endpoints': {
             'authentication': {
                 'health': 'GET /auth/health',
                 'status': 'GET /auth/status',
                 'dhan_context': 'POST /auth/dhan-context',
-                'oauth_login': 'GET /auth/oauth/login',
-                'oauth_callback': 'GET /auth/callback',
+                'oauth_initiate': 'POST /auth/oauth/initiate',
+                'oauth_token': 'POST /auth/oauth/token',
                 'pin_totp': 'POST /auth/pin-totp',
-                'renew_token': 'POST /auth/renew-token',
-                'user_profile': 'GET /auth/user-profile'
+                'renew_token': 'POST /auth/renew',
+                'user_profile': 'GET /auth/profile'
             },
             'orders': {
-                'place': 'POST /orders/place',
-                'modify': 'PUT /orders/modify',
-                'cancel': 'DELETE /orders/cancel',
-                'list': 'GET /orders/list',
-                'by_id': 'GET /orders/<order_id>',
-                'by_correlation_id': 'GET /orders/correlation/<correlation_id>'
+                'place': 'POST /order/place',
+                'list': 'GET /order/list',
+                'by_id': 'GET /order/<order_id>',
+                'by_correlation_id': 'GET /order/correlation/<correlation_id>',
+                'modify': 'PUT /order/modify/<order_id>',
+                'cancel': 'DELETE /order/cancel/<order_id>'
             },
             'portfolio': {
                 'funds': 'GET /portfolio/funds',
                 'positions': 'GET /portfolio/positions',
                 'holdings': 'GET /portfolio/holdings',
-                'trade_book': 'GET /portfolio/trade-book',
+                'trade_book': 'GET /portfolio/trades',
                 'trade_history': 'GET /portfolio/trade-history'
             },
             'market': {
-                'ohlc': 'POST /market/ohlc',
-                'historical_daily': 'POST /market/historical-daily',
-                'intraday_minute': 'POST /market/intraday-minute',
-                'option_chain': 'POST /market/option-chain',
-                'expired_options': 'GET /market/expired-options',
-                'expiry_list': 'GET /market/expiry-list',
-                'security_list': 'GET /market/security-list'
+                'quote': 'GET /data/quote/<symbol>',
+                'historical': 'GET /data/historical/<symbol>',
+                'intraday': 'GET /data/intraday/<symbol>',
+                'option_chain': 'GET /data/option-chain/<symbol>',
+                'expired_options': 'GET /data/expired-options',
+                'expiry_list': 'GET /data/expiry-list/<symbol>',
+                'security_list': 'GET /data/security-list'
             },
             'forever_orders': {
-                'place': 'POST /forever-orders/place',
-                'modify': 'PUT /forever-orders/modify',
-                'cancel': 'DELETE /forever-orders/cancel'
+                'place': 'POST /forever/place',
+                'modify': 'PUT /forever/modify/<order_id>',
+                'cancel': 'DELETE /forever/cancel/<order_id>'
             },
             'websocket': {
-                'market_feed': 'GET /websocket/market-feed',
-                'order_update': 'GET /websocket/order-update',
-                'full_depth': 'GET /websocket/full-depth'
+                'market_feed_start': 'POST /ws/market-feed/start',
+                'market_feed_data': 'GET /ws/market-feed/data',
+                'market_feed_stop': 'POST /ws/market-feed/stop',
+                'order_updates_start': 'POST /ws/order-updates/start',
+                'order_updates_data': 'GET /ws/order-updates/data',
+                'full_depth_start': 'POST /ws/full-depth/start',
+                'full_depth_data': 'GET /ws/full-depth/data'
             },
             'edis': {
-                'generate_tpin': 'POST /edis/generate-tpin',
-                'open_browser': 'POST /edis/open-browser-tpin',
-                'inquiry': 'POST /edis/inquiry'
+                'generate_tpin': 'POST /edis/tpin',
+                'open_browser': 'POST /edis/browser',
+                'inquiry': 'GET /edis/inquiry'
             },
-            'ip': {
-                'set': 'POST /ip/set',
-                'modify': 'PUT /ip/modify',
-                'get': 'GET /ip/get'
+            'ip_management': {
+                'set_ip': 'POST /admin/set-ip',
+                'modify_ip': 'PUT /admin/modify-ip',
+                'get_ip': 'GET /admin/get-ip'
             },
             'utility': {
-                'health': 'GET /util/health',
-                'status': 'GET /util/status',
-                'time_converter': 'POST /util/time-converter',
-                'indices': 'GET /util/indices'
+                'health': 'GET /health',
+                'status': 'GET /status',
+                'time_converter': 'POST /utility/time-convert',
+                'indices': 'GET /utility/indices'
             }
         }
     })
@@ -1336,9 +1533,11 @@ def api_documentation():
 # ==================== MAIN ====================
 
 if __name__ == '__main__':
+    logger.info("="*60)
     logger.info("Starting DhanHQ Analytics Backend")
     logger.info(f"Client ID: {config.DHAN_CLIENT_ID}")
     logger.info(f"Environment: {config.FLASK_ENV}")
+    logger.info("="*60)
     
     # Run Flask app
     app.run(
