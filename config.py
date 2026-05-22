@@ -1,18 +1,76 @@
 import os
-from dotenv import load_dotenv
+from datetime import timedelta
 
-# Load from .env file
-load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
+class Config:
+    """Base configuration"""
+    # Flask Configuration
+    SECRET_KEY = os.getenv('SECRET_KEY', 'your-secret-key-change-in-production')
+    SESSION_COOKIE_SECURE = True
+    SESSION_COOKIE_HTTPONLY = True
+    PERMANENT_SESSION_LIFETIME = timedelta(hours=24)
+    
+    # DhanHQ Configuration
+    DHAN_CLIENT_ID = os.getenv('DHAN_CLIENT_ID', '1106299230')
+    DHAN_ACCESS_TOKEN = os.getenv('DHAN_ACCESS_TOKEN', '')
+    
+    # OAuth Configuration
+    DHAN_OAUTH_CLIENT_ID = os.getenv('DHAN_OAUTH_CLIENT_ID', '')
+    DHAN_OAUTH_CLIENT_SECRET = os.getenv('DHAN_OAUTH_CLIENT_SECRET', '')
+    DHAN_OAUTH_REDIRECT_URI = os.getenv('DHAN_OAUTH_REDIRECT_URI', 'http://localhost:5000/auth/callback')
+    
+    # eDIS Configuration
+    DHAN_EDIS_CLIENT_ID = os.getenv('DHAN_EDIS_CLIENT_ID', '')
+    DHAN_EDIS_CLIENT_SECRET = os.getenv('DHAN_EDIS_CLIENT_SECRET', '')
+    
+    # Authentication Configuration
+    DHAN_TOTP_SECRET = os.getenv('DHAN_TOTP_SECRET', '')
+    
+    # Logging Configuration
+    LOG_FILE = os.getenv('LOG_FILE', 'app.log')
+    LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+    
+    # Market Indices
+    INDICES = {
+        'NIFTY': 13,
+        'BANKNIFTY': 25,
+        'FINNIFTY': 27,
+        'MIDCPNIFTY': 442,
+        'SENSEX': 51,
+        'BANKEX': 49
+    }
+    
+    # API Configuration
+    DEBUG = False
+    TESTING = False
+    FLASK_ENV = 'production'
 
-CLIENT_ID = os.getenv('DHAN_CLIENT_ID', '1106299230')
-ACCESS_TOKEN = os.getenv('DHAN_ACCESS_TOKEN', '')
+class DevelopmentConfig(Config):
+    """Development configuration"""
+    DEBUG = True
+    TESTING = False
+    FLASK_ENV = 'development'
+    SESSION_COOKIE_SECURE = False
 
-if not ACCESS_TOKEN:
-    raise ValueError('Set DHAN_ACCESS_TOKEN in .env file!')
+class ProductionConfig(Config):
+    """Production configuration"""
+    DEBUG = False
+    TESTING = False
+    FLASK_ENV = 'production'
 
-BASE_URL = 'https://api.dhan.co/v2'
-HEADERS = {
-    'access-token': ACCESS_TOKEN,
-    'client-id': CLIENT_ID,
-    'Content-Type': 'application/json'
-}
+class TestingConfig(Config):
+    """Testing configuration"""
+    DEBUG = True
+    TESTING = True
+    FLASK_ENV = 'testing'
+    WTF_CSRF_ENABLED = False
+
+def get_config():
+    """Get configuration based on environment"""
+    env = os.getenv('FLASK_ENV', 'development').lower()
+    
+    if env == 'production':
+        return ProductionConfig()
+    elif env == 'testing':
+        return TestingConfig()
+    else:
+        return DevelopmentConfig()
